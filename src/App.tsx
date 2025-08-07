@@ -1,70 +1,143 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 import LanguageSelector from "./LanguageSelector";
 import TextInput from "./TextInput";
 import TranslateButton from "./TranslateButton";
 import TranslationOutput from "./TranslationOutput";
 
+const ASSEMBLYAI_API_KEY = "48d77423ca20440793b7e33f7859c943";
+
 const VoiceInput: React.FC<{ onResult: (text: string) => void }> = ({
   onResult,
 }) => {
-  const [listening, setListening] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
-  const handleVoiceInput = () => {
-    if (
-      !("webkitSpeechRecognition" in window || "SpeechRecognition" in window)
-    ) {
-      alert("Speech Recognition is not supported in this browser.");
+  const handleVoiceInput = async () => {
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      alert("Audio recording is not supported in this browser.");
       return;
     }
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en-US";
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
 
-    recognition.onstart = () => setListening(true);
-    recognition.onend = () => setListening(false);
+    if (!recording && !processing) {
+      setRecording(true);
+      audioChunksRef.current = [];
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
 
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      onResult(transcript);
-    };
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
 
-    recognition.onerror = () => setListening(false);
+      mediaRecorder.onstop = async () => {
+        setRecording(false);
+        setProcessing(true); 
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: "audio/webm",
+        });
 
-    recognition.start();
+        const transcript = await transcribeWithAssemblyAI(audioBlob);
+        setProcessing(false);
+        if (transcript) onResult(transcript);
+      };
+
+      mediaRecorder.start();
+      setTimeout(() => {
+        mediaRecorder.stop();
+        stream.getTracks().forEach((track) => track.stop());
+      }, 10000); 
+    }
   };
 
   return (
     <button
       type="button"
       onClick={handleVoiceInput}
-      className={`flex items-center gap-2 px-4 py-2 rounded-full bg-gradient-to-r from-pink-400 to-purple-500 text-white font-semibold shadow-md transition-all duration-200 hover:scale-105 hover:from-purple-500 hover:to-pink-400 focus:outline-none ${
-        listening ? "ring-4 ring-pink-300" : ""
+      disabled={recording || processing}
+      className={`flex items-center gap-2 px-4 py-2 rounded-full bg-gradient-to-r from-pink-400 to-purple-500 text-white font-semibold shadow-md transition-all duration-200 ${
+        recording || processing
+          ? "opacity-50 cursor-not-allowed"
+          : "hover:scale-105 hover:from-purple-500 hover:to-pink-400"
       }`}
-      aria-pressed={listening}
+      aria-pressed={recording || processing}
       title="Voice Input"
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"
-        className={`h-6 w-6 ${listening ? "animate-pulse" : ""}`}
+        className={`h-6 w-6 ${recording ? "animate-pulse" : ""}`}
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
       >
+        <circle cx="12" cy="12" r="10" fill={recording ? "#f472b6" : "none"} />
         <path
           strokeLinecap="round"
           strokeLinejoin="round"
           strokeWidth={2}
-          d="M12 18v3m0 0h3m-3 0H9m6-3a6 6 0 01-12 0V9a6 6 0 0112 0v6z"
+          d="M12 18v3m0 0h3m-3 0H9"
         />
       </svg>
-      {listening ? "Listening..." : "Voice Input"}
+      {recording
+        ? "Recording..."
+        : processing
+        ? "Processing..."
+        : "Voice Input"}
     </button>
   );
 };
+
+
+async function transcribeWithAssemblyAI(
+  audioBlob: Blob
+): Promise<string | null> {
+
+  const uploadRes = await fetch("https://api.assemblyai.com/v2/upload", {
+    method: "POST",
+    headers: { authorization: ASSEMBLYAI_API_KEY },
+    body: audioBlob,
+  });
+  const uploadData = await uploadRes.json();
+  if (!uploadData.upload_url) return null;
+
+  
+  const transcriptRes = await fetch(
+    "https://api.assemblyai.com/v2/transcript",
+    {
+      method: "POST",
+      headers: {
+        authorization: ASSEMBLYAI_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ audio_url: uploadData.upload_url }),
+    }
+  );
+  const transcriptData = await transcriptRes.json();
+  const transcriptId = transcriptData.id;
+  if (!transcriptId) return null;
+
+  
+  let transcriptText = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const pollingRes = await fetch(
+      `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
+      {
+        headers: { authorization: ASSEMBLYAI_API_KEY },
+      }
+    );
+    const pollingData = await pollingRes.json();
+    if (pollingData.status === "completed") {
+      transcriptText = pollingData.text;
+      break;
+    }
+    if (pollingData.status === "failed") break;
+  }
+  return transcriptText;
+}
 
 const App: React.FC = () => {
   const [sourceLanguage, setSourceLanguage] = useState("en");
@@ -131,17 +204,14 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen min-w-screen w-full h-full bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 flex items-center justify-center py-4 px-1 font-mono">
+    <div className="min-h-screen min-w-screen w-full h-full bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 flex items-center justify-center py-2 px-1 font-mono text-base">
       <div
         className="
           w-full
           h-full
-          max-w-full
-          max-h-full
+          max-w-screen-sm
           md:max-w-[95vw]
-          md:max-h-[90vh]
           xl:max-w-[1400px]
-          xl:max-h-[900px]
           min-h-[96vh]
           min-w-[96vw]
           bg-white/90
@@ -153,13 +223,14 @@ const App: React.FC = () => {
           border border-purple-200
           flex flex-col
           justify-between
+          overflow-auto
         "
       >
-        <h1 className="text-3xl sm:text-4xl md:text-5xl font-extrabold text-center mb-6 sm:mb-8 text-transparent bg-clip-text bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 drop-shadow-md font-mono">
+        <h1 className="text-2xl sm:text-4xl md:text-5xl font-extrabold text-center mb-4 sm:mb-8 text-transparent bg-clip-text bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 drop-shadow-md font-mono">
           Language Translator
         </h1>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6 mb-6 sm:mb-8 text-lg sm:text-xl">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-6 mb-4 sm:mb-8 text-base sm:text-xl">
           <LanguageSelector
             label="Source"
             selectedLanguage={sourceLanguage}
@@ -174,29 +245,29 @@ const App: React.FC = () => {
           />
         </div>
 
-        <div className="flex flex-col md:flex-row gap-3 sm:gap-4 mb-5 sm:mb-6 text-lg sm:text-xl">
+        <div className="flex flex-col md:flex-row gap-2 sm:gap-4 mb-4 sm:mb-6 text-base sm:text-xl">
           <div className="flex-1">
             <TextInput
               value={inputText}
               onChange={setInputText}
               placeholder="Input your text here..."
-              className="w-full rounded-xl border-2 border-purple-300 focus:border-pink-400 focus:ring-2 focus:ring-pink-200 transition text-base sm:text-lg md:text-2xl p-3 sm:p-4 bg-white/80"
+              className="w-full rounded-xl border-2 border-purple-300 focus:border-pink-400 focus:ring-2 focus:ring-pink-200 transition text-base sm:text-lg md:text-2xl p-2 sm:p-4 bg-white/80"
             />
           </div>
-          <div className="flex items-center justify-center">
+          <div className="flex items-center justify-center mt-2 md:mt-0">
             <VoiceInput onResult={setInputText} />
           </div>
         </div>
 
-        <div className="flex justify-center mb-6 sm:mb-8">
+        <div className="flex justify-center mb-4 sm:mb-8">
           <TranslateButton
             onClick={handleTranslate}
             isLoading={isLoading}
-            className="px-6 sm:px-8 py-2 sm:py-3 rounded-full bg-gradient-to-r from-blue-500 to-pink-500 text-white font-bold text-lg sm:text-xl shadow-lg transition-all duration-200 hover:scale-105 hover:from-pink-500 hover:to-blue-500 focus:outline-none"
+            className="px-4 sm:px-8 py-2 sm:py-3 rounded-full bg-gradient-to-r from-blue-500 to-pink-500 text-white font-bold text-base sm:text-xl shadow-lg transition-all duration-200 hover:scale-105 hover:from-pink-500 hover:to-blue-500 focus:outline-none"
           />
         </div>
 
-        <div className="bg-gradient-to-r from-purple-100 to-pink-100 rounded-xl p-4 sm:p-6 shadow-inner min-h-[90px] sm:min-h-[120px] md:min-h-[160px] transition-all duration-200 hover:shadow-lg">
+        <div className="bg-gradient-to-r from-purple-100 to-pink-100 rounded-xl p-3 sm:p-6 shadow-inner min-h-[70px] sm:min-h-[120px] md:min-h-[160px] transition-all duration-200 hover:shadow-lg">
           <TranslationOutput text={translatedText} />
         </div>
       </div>
